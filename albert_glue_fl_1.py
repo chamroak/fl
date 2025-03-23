@@ -1,4 +1,9 @@
 # !pip install nvidia-ml-py3
+# !pip install transformers
+# !pip install plotly
+# !pip install datasets
+# !pip install pynvml
+# !pip install sentencepiece
 import torch
 import torch.nn as nn
 from transformers import get_linear_schedule_with_warmup
@@ -9,7 +14,7 @@ import json
 import numpy as np
 import random
 from torch.utils.data import DataLoader
-from transformers import AlbertForSequenceClassification, AlbertTokenizer, AutoConfig, AdamW
+from transformers import AlbertForSequenceClassification, AlbertTokenizer, AutoConfig
 from tqdm import tqdm
 from threading import Thread
 from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetPowerUsage, nvmlDeviceGetMemoryInfo, nvmlShutdown
@@ -23,6 +28,9 @@ import matplotlib.pyplot as plt
 import json
 import os
 from collections import Counter
+import math
+import sentencepiece
+import gc
 
 class LoRALayer(nn.Module):
     """
@@ -217,61 +225,98 @@ def evaluate(model, data_loader, loss_fn):
     return avg_loss, accuracy
 
 
-def perturbed_inference_train(model, train_loader, num_epochs, learning_rate, perturbation_strength):
-    optimizer = AdamW(model.parameters(), lr=learning_rate)
+def perturbed_inference_train(model, train_loader, num_epochs, learning_rate, perturbation_strength=0.01):
+    """
+    Train a model using SPSA-based perturbation while applying perturbation every other step for better efficiency.
 
+    Args:
+        model (torch.nn.Module): The ALBERT model.
+        train_loader (DataLoader): Training data loader.
+        num_epochs (int): Number of training epochs.
+        learning_rate (float): Learning rate.
+        perturbation_strength (float): Strength of perturbation in SPSA.
+    """
+    print(">>>> Start Optimized SPSA Training (Perturbation every 2 steps)")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
     model.to(device)
+    model.train()
 
-    gradient_accumulation_steps = 4
+    loss_fn = torch.nn.CrossEntropyLoss()
 
-    for epoch in tqdm(range(num_epochs), desc="Epochs"):
-        model.train()
-        total_loss = 0
-        batch_count = 0
-        optimizer.zero_grad()
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        total_batches = 0
 
-        train_progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}", leave=False)
-
-        for i, batch in enumerate(train_progress_bar):
+        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)):
             batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'])
-            logits = outputs.logits
-            labels = batch["labels"]
 
-            loss_fn = torch.nn.CrossEntropyLoss()
-            current_loss = loss_fn(logits, labels)
-            loss_value = current_loss.item()
-            total_loss += loss_value
-            batch_count += 1
-            train_progress_bar.set_postfix({"loss": f"{loss_value:.4f}"})
+            if step % 2 == 0:
+                # Ensure reproducible delta generation
+                def generate_delta():
+                    torch.manual_seed(42)  
+                    np.random.seed(42)
+                    random.seed(42)
+                    return {name: perturbation_strength * (2 * torch.randint(0, 2, p.shape, device=device) - 1)
+                            for name, p in model.named_parameters() if p.requires_grad}
 
-            if i % 2 == 0:
-                perturbed_logits = logits + torch.randn_like(logits) * (perturbation_strength / 2)
-                perturbed_loss = loss_fn(perturbed_logits, labels)
-                total_loss_batch = (current_loss + perturbed_loss) / 2
-            else:
-                total_loss_batch = current_loss
+                delta = generate_delta()
 
-            total_loss_batch = total_loss_batch / gradient_accumulation_steps
-            total_loss_batch.backward()
+                # Debugging: Check delta values
+                # if step % 50 == 0:
+                #     for name, d in delta.items():
+                #         print(f"Delta {name}: min={d.min().item()}, max={d.max().item()}")
 
-            if (i + 1) % gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+                # Apply positive perturbation
+                for name, p in model.named_parameters():
+                    if name in delta:
+                        p.data.add_(delta[name])
 
-            del outputs, logits, current_loss, total_loss_batch
-            if 'perturbed_logits' in locals():
-                del perturbed_logits
-            if 'perturbed_loss' in locals():
-                del perturbed_loss
-            torch.cuda.empty_cache()
+                # Forward pass with positive perturbation
+                with torch.no_grad():
+                    outputs_pos = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'])
+                    loss_pos = loss_fn(outputs_pos.logits, batch["labels"]).item()  
 
-        print(f"Epoch {epoch + 1}, Average Loss: {total_loss / batch_count:.4f}")
+                # Restore original weights before negative perturbation
+                for name, p in model.named_parameters():
+                    if name in delta:
+                        p.data.sub_(delta[name])  # Undo positive perturbation
 
+                # Apply negative perturbation
+                for name, p in model.named_parameters():
+                    if name in delta:
+                        p.data.sub_(delta[name])  # Apply negative perturbation
+
+                # Forward pass with negative perturbation
+                with torch.no_grad():
+                    outputs_neg = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'])
+                    loss_neg = loss_fn(outputs_neg.logits, batch["labels"]).item()
+
+                # Restore original weights before gradient update
+                for name, p in model.named_parameters():
+                    if name in delta:
+                        p.data.add_(delta[name])  # Undo negative perturbation
+
+                # Estimate gradient and update weights
+                for name, p in model.named_parameters():
+                    if name in delta:
+                        grad_estimate = (loss_pos - loss_neg) / (2 * (torch.abs(delta[name]) + 1e-8))
+                        p.data.add_(-learning_rate * grad_estimate)  # Update weights
+
+                # Accumulate loss correctly
+                total_loss += (loss_pos + loss_neg) / 2  
+                total_batches += 1
+
+                # Free memory manually
+                del outputs_pos, outputs_neg, delta
+                torch.cuda.empty_cache()
+                gc.collect()
+
+        avg_loss = total_loss / max(total_batches, 1)  # Avoid division by zero
+        print(f"Epoch {epoch+1} - SPSA Training Loss: {avg_loss:.4f}")
+
+    print(">>>> Done Optimized SPSA Training")
     return model
+
 
 def bp_train(model, train_loader, test_loader, num_epochs, learning_rate, 
              total_training_steps, warmup_steps, client_id, gradient_accumulation_steps=4):
@@ -427,13 +472,20 @@ def train_for_client(client_id, model_path, tokenizer, batch_size, num_epochs, l
         torch.cuda.empty_cache()
 
     # Pass training_steps and warmup_steps to bp_train
+    # measure_function_energy(
+    #     bp_train,
+    #     args=(model, train_loader, test_loader, num_epochs, learning_rate, total_training_steps, warmup_steps, client_id),
+    #     interval=1,
+    #     output_file=f"energy_log_client_{client_id}.csv"
+    # )
+
     measure_function_energy(
-        bp_train,
-        args=(model, train_loader, test_loader, num_epochs, learning_rate, total_training_steps, warmup_steps, client_id),
+        perturbed_inference_train,
+        args=(model, train_loader, num_epochs, learning_rate, perturbation_strength),
         interval=1,
         output_file=f"energy_log_client_{client_id}.csv"
     )
-
+    
     # Return state dict
     return model.state_dict()
 

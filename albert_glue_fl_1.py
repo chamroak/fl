@@ -77,7 +77,7 @@ class LoRALayer(nn.Module):
         return self.original_layer.attention(query, key, value, attention_mask=attention_mask)
 # calculates the number of clients (in this test just returns 2)
 def get_number_of_clients():
-    return 2
+    return 1
 
 
 def tokenize_function(examples, tokenizer, max_length):
@@ -225,97 +225,144 @@ def evaluate(model, data_loader, loss_fn):
     return avg_loss, accuracy
 
 
-def perturbed_inference_train(model, train_loader, num_epochs, learning_rate, perturbation_strength=0.01):
+def perturbed_inference_train(model, train_loader, test_loader, num_epochs, learning_rate, client_id, perturbation_strength=0.005):
     """
-    Train a model using SPSA-based perturbation while applying perturbation every other step for better efficiency.
+    Train a model using SPSA-based perturbation while applying perturbation every step.
+    Logs training progress and saves evaluation metrics (accuracy and loss on train and test datasets) to a CSV file.
 
     Args:
-        model (torch.nn.Module): The ALBERT model.
+        model (torch.nn.Module): The model to train.
         train_loader (DataLoader): Training data loader.
+        test_loader (DataLoader): Test data loader.
         num_epochs (int): Number of training epochs.
         learning_rate (float): Learning rate.
+        client_id (str/int): Identifier used to name the CSV file for saving metrics.
         perturbation_strength (float): Strength of perturbation in SPSA.
     """
-    print(">>>> Start Optimized SPSA Training (Perturbation every 2 steps)")
+    import os, csv, gc, random
+    from tqdm import tqdm
+    import numpy as np
+    import torch
+
+    print(">>>> Start Optimized SPSA Training (Perturbation every step)")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
 
     loss_fn = torch.nn.CrossEntropyLoss()
+    metrics = []
 
     for epoch in range(num_epochs):
         total_loss = 0.0
         total_batches = 0
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
 
-        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)):
+        for step, batch in enumerate(progress_bar):
             batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Reproducible perturbation generation.
+            def generate_delta():
+                seed = 42 + step
+                torch.manual_seed(seed)
+                np.random.seed(seed)
+                random.seed(seed)
+                return {
+                    name: perturbation_strength * torch.randn(p.shape, device=device)
+                    for name, p in model.named_parameters() if p.requires_grad
+                }
 
-            if step % 2 == 0:
-                # Ensure reproducible delta generation
-                def generate_delta():
-                    torch.manual_seed(42)  
-                    np.random.seed(42)
-                    random.seed(42)
-                    return {name: perturbation_strength * (2 * torch.randint(0, 2, p.shape, device=device) - 1)
-                            for name, p in model.named_parameters() if p.requires_grad}
+            delta = generate_delta()
 
-                delta = generate_delta()
+            # Apply positive perturbation.
+            for name, p in model.named_parameters():
+                if name in delta:
+                    p.data.add_(delta[name])
+            # Forward pass with positive perturbation.
+            with torch.no_grad():
+                outputs_pos = model(input_ids=batch['input_ids'],
+                                    attention_mask=batch['attention_mask'],
+                                    labels=batch['labels'])
+                loss_pos = loss_fn(outputs_pos.logits, batch["labels"]).item()
 
-                # Debugging: Check delta values
-                # if step % 50 == 0:
-                #     for name, d in delta.items():
-                #         print(f"Delta {name}: min={d.min().item()}, max={d.max().item()}")
+            # Restore original weights (undo positive perturbation).
+            for name, p in model.named_parameters():
+                if name in delta:
+                    p.data.sub_(delta[name])
 
-                # Apply positive perturbation
-                for name, p in model.named_parameters():
-                    if name in delta:
-                        p.data.add_(delta[name])
+            # Apply negative perturbation.
+            for name, p in model.named_parameters():
+                if name in delta:
+                    p.data.sub_(delta[name])
+            # Forward pass with negative perturbation.
+            with torch.no_grad():
+                outputs_neg = model(input_ids=batch['input_ids'],
+                                    attention_mask=batch['attention_mask'],
+                                    labels=batch['labels'])
+                loss_neg = loss_fn(outputs_neg.logits, batch["labels"]).item()
 
-                # Forward pass with positive perturbation
-                with torch.no_grad():
-                    outputs_pos = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'])
-                    loss_pos = loss_fn(outputs_pos.logits, batch["labels"]).item()  
+            # Restore original weights before gradient update.
+            for name, p in model.named_parameters():
+                if name in delta:
+                    p.data.add_(delta[name])
 
-                # Restore original weights before negative perturbation
-                for name, p in model.named_parameters():
-                    if name in delta:
-                        p.data.sub_(delta[name])  # Undo positive perturbation
+            # Estimate gradient and update weights.
+            for name, p in model.named_parameters():
+                if name in delta:
+                    # Since delta = perturbation_strength * z, we recover z:
+                    z = delta[name] / perturbation_strength
+                    grad_estimate = ((loss_pos - loss_neg) / (2 * perturbation_strength)) * z
+                    p.data.add_(-learning_rate * grad_estimate)
 
-                # Apply negative perturbation
-                for name, p in model.named_parameters():
-                    if name in delta:
-                        p.data.sub_(delta[name])  # Apply negative perturbation
+            total_loss += (loss_pos + loss_neg) / 2  
+            total_batches += 1
 
-                # Forward pass with negative perturbation
-                with torch.no_grad():
-                    outputs_neg = model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], labels=batch['labels'])
-                    loss_neg = loss_fn(outputs_neg.logits, batch["labels"]).item()
+            avg_loss = total_loss / total_batches
+            progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
+            
+            #stepwise loss
+            with open(f'stepwise_loss_client_{client_id}.csv', 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([epoch + 1, step, avg_loss])
 
-                # Restore original weights before gradient update
-                for name, p in model.named_parameters():
-                    if name in delta:
-                        p.data.add_(delta[name])  # Undo negative perturbation
+            del outputs_pos, outputs_neg, delta
+            torch.cuda.empty_cache()
+            gc.collect()
 
-                # Estimate gradient and update weights
-                for name, p in model.named_parameters():
-                    if name in delta:
-                        grad_estimate = (loss_pos - loss_neg) / (2 * (torch.abs(delta[name]) + 1e-8))
-                        p.data.add_(-learning_rate * grad_estimate)  # Update weights
+        epoch_avg_loss = total_loss / max(total_batches, 1)
+        print(f"Epoch {epoch+1} - SPSA Training Loss: {epoch_avg_loss:.4f}")
 
-                # Accumulate loss correctly
-                total_loss += (loss_pos + loss_neg) / 2  
-                total_batches += 1
+        # Evaluate model on both training and test sets.
+        model.eval()
+        train_epoch_loss, train_epoch_accuracy = evaluate(model, train_loader, loss_fn)
+        test_epoch_loss, test_epoch_accuracy = evaluate(model, test_loader, loss_fn)
+        model.train()
+        print(f"Epoch {epoch+1} - Train Loss: {train_epoch_loss:.4f}, Train Acc: {train_epoch_accuracy:.4f} | "
+              f"Test Loss: {test_epoch_loss:.4f}, Test Acc: {test_epoch_accuracy:.4f}")
 
-                # Free memory manually
-                del outputs_pos, outputs_neg, delta
-                torch.cuda.empty_cache()
-                gc.collect()
+        metrics.append({
+            "Round": epoch + 1,
+            "Train Accuracy": train_epoch_accuracy,
+            "Train Loss": train_epoch_loss,
+            "Test Accuracy": test_epoch_accuracy,
+            "Test Loss": test_epoch_loss
+        })
 
-        avg_loss = total_loss / max(total_batches, 1)  # Avoid division by zero
-        print(f"Epoch {epoch+1} - SPSA Training Loss: {avg_loss:.4f}")
-
+    # Save the metrics to a CSV file.
+    filename = f"client_metrics_{client_id}.csv"
+    file_exists = os.path.exists(filename)
+    with open(filename, mode='a', newline='') as csv_file:
+        fieldnames = ["Round", "Train Accuracy", "Train Loss", "Test Accuracy", "Test Loss"]
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for row in metrics:
+            writer.writerow(row)
+    print(f"Metrics appended to {filename}")
     print(">>>> Done Optimized SPSA Training")
+
     return model
+
 
 
 def bp_train(model, train_loader, test_loader, num_epochs, learning_rate, 
@@ -481,7 +528,7 @@ def train_for_client(client_id, model_path, tokenizer, batch_size, num_epochs, l
 
     measure_function_energy(
         perturbed_inference_train,
-        args=(model, train_loader, num_epochs, learning_rate, perturbation_strength),
+        args=(model, train_loader,test_loader, num_epochs, learning_rate,client_id, perturbation_strength),
         interval=1,
         output_file=f"energy_log_client_{client_id}.csv"
     )
@@ -642,11 +689,11 @@ def create_model(model_name, model_path):
 def main():
     round_number = 40
     max_length = 128
-    batch_size = 16
+    batch_size = 64
     seed = 42
     num_epochs = 1
-    learning_rate = 2e-5  
-    perturbation_strength = 0.1
+    learning_rate = 1e-6  
+    perturbation_strength = 1e-3
     gradient_accumulation_steps = 4
 
     model_name = "albert-base-v2"

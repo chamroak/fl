@@ -1,5 +1,5 @@
 {
-  "_name_or_path": "./global_models",
+  "_name_or_path": "albert-base-v2",
   "architectures": [
     "AlbertForSequenceClassification"
   ],
